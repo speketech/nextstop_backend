@@ -9,7 +9,6 @@ const { authenticate, authorize } = require('../middleware/auth');
 const { calculateFareBreakdown, estimateFare } = require('../services/fareService');
 const db     = require('../config/database');
 const logger = require('../config/logger');
-const isw    = require('../services/interswitchService');
 
 // ─── State machine: valid transitions ────────────────────────────────────────
 const VALID_TRANSITIONS = {
@@ -192,27 +191,10 @@ router.patch(
       if (newStatus === 'ACCEPTED')    updatePayload.accepted_at   = now;
       if (newStatus === 'ARRIVED')     updatePayload.arrived_at    = now;
       if (newStatus === 'IN_PROGRESS') updatePayload.started_at    = now;
-      if (newStatus === 'COMPLETED') {
-        updatePayload.completed_at = now;
-
-        // 🚀 DELAYED SPLIT (Escrow): Release funds to driver upon completion
-        try {
-          const [driver] = await db('drivers')
-            .where({ id: ride.driver_id })
-            .select('sub_account_code')
-            .first();
-
-          if (driver && driver.sub_account_code) {
-            const successfulTxs = await db('transactions')
-              .where({ ride_id: rideId, status: 'SUCCESS', payout_status: 'PENDING' });
-
-            for (const tx of successfulTxs) {
-              await isw.releaseRideFunds(tx.tx_ref, driver.sub_account_code, Number(tx.amount_naira));
-            }
-          }
-        } catch (releaseErr) {
-          logger.error('[Rides] Automatic escrow release failed', { rideId, error: releaseErr.message });
-        }
+      if (newStatus === 'COMPLETED')   updatePayload.completed_at  = now;
+      if (newStatus === 'CANCELLED') {
+        updatePayload.cancelled_by  = req.user.role === 'DRIVER' ? 'DRIVER' : 'INITIATOR';
+        updatePayload.cancel_reason = cancelReason || null;
       }
 
       await db('rides').where({ id: rideId }).update(updatePayload);

@@ -1030,23 +1030,22 @@ async function checkAddressStatus(reference) {
  * Creates a sub-account for a driver for automated split settlements (QTB Partner API)
  * 
  * @param {Object} driverData
- * @param {string} driverData.accountNumber
+ * @param {string} driverData.bankAccount
  * @param {string} driverData.bankCode
  * @param {string} driverData.fullName
- * @returns {Promise<{success:boolean, subAccountCode?:string, message?:string}>}
+ * @returns {Promise<string>} subAccountCode
  */
-async function createDriverSubAccount(driverData) {
+async function createSubAccount(driverData) {
   try {
     const token = await getPaymentToken(); 
 
     const response = await axios.post(
       `${QTB.BASE_URL}/collections/api/v1/subaccounts`,
       {
-        accountNumber: driverData.accountNumber,
+        accountNumber: driverData.bankAccount,
         bankCode: driverData.bankCode,
         accountName: driverData.fullName,
-        splitPercentage: 85.0, // Drivers get 85% by default
-        description: `NextStop Driver: ${driverData.fullName}`
+        splitPercentage: 85.0, // This is your "Modern Danfo" standard
       },
       {
         headers: { Authorization: `Bearer ${token}` },
@@ -1056,13 +1055,13 @@ async function createDriverSubAccount(driverData) {
 
     const subAccountCode = response.data.subAccountCode;
     logger.info('[ISW-SubAccount] Created successfully', { subAccountCode, driver: driverData.fullName });
-    return { success: true, subAccountCode };
+    return subAccountCode;
   } catch (error) {
     logger.error('[ISW-SubAccount] Creation failed', { 
       error: error.response?.data || error.message,
       driver: driverData.fullName 
     });
-    return { success: false, message: 'Failed to create Interswitch sub-account' };
+    throw error;
   }
 }
 
@@ -1152,9 +1151,9 @@ module.exports = {
   initiatePayment,            // builds Webpay URL + saves PENDING tx
   verifyTransaction,          // server-to-server ISW check — ALWAYS call after payment
   validateWebhookSignature,   // HMAC-SHA512 check on incoming ISW webhook POSTs
-  createDriverSubAccount,     // Sub-account onboarding
-  triggerDriverPayout,        // Manual withdrawal
-  releaseRideFunds,           // Escrow release (Delayed Split)
+  createSubAccount,            // Sub-account onboarding
+  triggerDriverPayout,         // Manual withdrawal
+  releaseRideFunds,            // Escrow release (Delayed Split)
 
   // ── SET B: KYC — fully implemented (MKT) ───────────────────────────────────
   verifyNIN,                  // NIN Verification API

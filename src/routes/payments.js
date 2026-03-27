@@ -70,8 +70,21 @@ router.post(
         });
       }
 
-      // 3. Initiate with Interswitch (Delayed Split/Escrow Flow)
-      // We no longer pass splits here; funds stay in Main Wallet until ride completion.
+      // 3. Fetch driver's sub-account for split settlement (Avoid NGN 0 issue)
+      const [driver] = await db('drivers')
+        .where({ id: ride.driver_id })
+        .select('sub_account_code')
+        .limit(1);
+
+      const splits = [];
+      if (driver && driver.sub_account_code) {
+        splits.push({
+          subAccountCode: driver.sub_account_code,
+          splitPercentage: 85.0 // Driver gets 85% cut automatically
+        });
+      }
+
+      // 4. Initiate with Interswitch
       const user = await db('users').where({ id: userId }).first();
       const { txRef, paymentUrl } = await isw.initiatePayment({
         rideId,
@@ -80,7 +93,7 @@ router.post(
         amountNaira,
         customerEmail: user.email,
         customerName:  user.full_name,
-        splits:        [] // Empty splits for delayed settlement
+        splits
       });
 
       // 4. Store payment URL for reference

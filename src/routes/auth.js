@@ -322,11 +322,18 @@ router.post('/verify-bank', authenticate, async (req, res) => {
     if (result.success) {
       // 🚀 AUTOMATION: Onboard driver as a sub-account for split settlements
       const user = await db('users').where({ id: req.user.id }).first();
-      const onboarding = await isw.createDriverSubAccount({
-        accountNumber,
-        bankCode,
-        fullName: user.full_name
-      });
+      
+      let subAccountCode = null;
+      try {
+        subAccountCode = await isw.createSubAccount({
+          bankAccount: accountNumber,
+          bankCode,
+          fullName: user.full_name
+        });
+      } catch (onboardingErr) {
+        logger.error('[Auth] Sub-account onboarding failed', { userId: req.user.id, error: onboardingErr.message });
+        // We continue anyway, but the driver won't get automated splits until fixed manually
+      }
 
       // Update the drivers table with bank details and sub-account code
       await db('drivers')
@@ -335,15 +342,15 @@ router.post('/verify-bank', authenticate, async (req, res) => {
           payout_bank_code: bankCode,
           payout_account_no: accountNumber,
           payout_account_name: result.data.accountName,
-          sub_account_code: onboarding.success ? onboarding.subAccountCode : null,
+          sub_account_code: subAccountCode,
           updated_at: new Date()
         });
 
       res.json({ 
         success: true, 
-        message: 'Bank account verified ' + (onboarding.success ? 'and payout sub-account created' : 'but sub-account creation pending'),
+        message: 'Bank account verified ' + (subAccountCode ? 'and payout sub-account created' : 'but sub-account creation failed'),
         accountName: result.data.accountName,
-        subAccountCode: onboarding.subAccountCode 
+        subAccountCode: subAccountCode 
       });
     } else {
       res.status(400).json({ success: false, message: result.message });
