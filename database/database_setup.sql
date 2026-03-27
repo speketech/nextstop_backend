@@ -69,6 +69,10 @@ CREATE TABLE drivers (
     payout_bank_code    VARCHAR(10),
     payout_account_no   VARCHAR(20),
     payout_account_name VARCHAR(120),
+    sub_account_code    VARCHAR(50)     COMMENT 'Interswitch QTB Sub-account Code for split settlements',
+
+    -- Verification References
+    address_verification_ref VARCHAR(100) COMMENT 'Reference ID from Interswitch Address API',
 
     -- Ratings
     rating              DECIMAL(3,2) NOT NULL DEFAULT 5.00,
@@ -253,6 +257,7 @@ CREATE TABLE transactions (
 
     -- Status
     status                  ENUM('PENDING','SUCCESS','FAILED','REVERSED') NOT NULL DEFAULT 'PENDING',
+    payout_status           ENUM('PENDING','RELEASED','FAILED') NOT NULL DEFAULT 'PENDING' COMMENT 'For Delayed Split/Escrow flow',
     payment_method          VARCHAR(50)     COMMENT 'card, bank_transfer, ussd, etc.',
 
     -- Interswitch Verification Response (stored for audit)

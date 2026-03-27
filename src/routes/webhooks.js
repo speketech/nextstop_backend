@@ -23,7 +23,8 @@ router.post('/', express.raw({ type: 'application/json' }), async (req, res) => 
   const sigHeader = req.headers['x-interswitch-signature'];
 
   // ── 1. Validate HMAC Signature ───────────────────────────────────────────
-  const isValidSig = isw.validateWebhookSignature(rawBody, sigHeader);
+  // Signature first, then rawBody Buffer
+  const isValidSig = isw.validateWebhookSignature(sigHeader, rawBody);
   if (!isValidSig) {
     logger.warn('[Webhook] Invalid Interswitch signature', { sig: sigHeader });
     // Return 200 to prevent ISW from retrying — log for investigation
@@ -63,7 +64,8 @@ router.post('/', express.raw({ type: 'application/json' }), async (req, res) => 
 
   // ── 4. Process based on event type ───────────────────────────────────────
   try {
-    if (eventType === 'PAYMENT_SUCCESS') {
+    // Both versions of the success event
+    if (eventType === 'PAYMENT_SUCCESS' || eventType === 'Transaction.Success') {
       await handlePaymentSuccess(payload);
     } else if (eventType === 'PAYMENT_REVERSAL') {
       await handlePaymentReversal(payload);

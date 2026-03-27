@@ -7,17 +7,6 @@
  *   POST /api/auth/signup
  *   POST /api/auth/login
  *   POST /api/auth/refresh
- *
- * Driver KYC (all use MKT credentials — Marketplace):
- *   POST /api/auth/verify-nin       → NIN Verification API
- *   POST /api/auth/verify-licence   → Driver's License API
- *   POST /api/auth/verify-bvn       → BVN Full Details API  (placeholder)
- *   POST /api/auth/verify-bank      → Bank Account Verification API (placeholder)
- *
- * Phone OTP (MKT credentials):
- *   POST /api/auth/send-otp         → WhatsApp OTP API
- *                                     NOTE: You generate the code; ISW delivers it
- *   POST /api/auth/confirm-otp      → Local DB check (no second ISW call needed)
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
@@ -25,12 +14,13 @@ const express  = require('express');
 const bcrypt   = require('bcryptjs');
 const { body, validationResult } = require('express-validator');
 const { v4: uuidv4 } = require('uuid');
+const jwt = require('jsonwebtoken');
 const router   = express.Router();
 
-const { generateTokens, authenticate, authorize } = require('../middleware/auth');
-const isw    = require('../services/interswitchService');
+const { generateTokens, authenticate } = require('../middleware/auth');
 const db     = require('../config/database');
 const logger = require('../config/logger');
+const isw    = require('../services/interswitchService');
 
 // ── Validation error handler ──────────────────────────────────────────────────
 function handleValidationErrors(req, res) {
@@ -100,7 +90,6 @@ router.post(
 
     try {
       const [user] = await db('users').where({ email }).limit(1);
-      // Same message for "not found" and "wrong password" — prevents user enumeration
       if (!user || !(await bcrypt.compare(password, user.password_hash))) {
         return res.status(401).json({ success: false, message: 'Invalid email or password' });
       }
@@ -126,323 +115,365 @@ router.post(
 );
 
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// POST /api/auth/refresh
-// ═══════════════════════════════════════════════════════════════════════════════
+// ─── Token Refresh Route ──────────────────────────────────────────────────────
 router.post('/refresh', async (req, res) => {
   const { refreshToken } = req.body;
-  if (!refreshToken) return res.status(400).json({ success: false, message: 'refreshToken required' });
+
+  if (!refreshToken) {
+    return res.status(401).json({ success: false, message: 'Refresh token required' });
+  }
 
   try {
-    const jwt     = require('jsonwebtoken');
-    const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET, { issuer: 'nextstop', audience: 'nextstop-app' });
-    const [user]  = await db('users').where({ id: decoded.sub, refresh_token: refreshToken }).limit(1);
-    if (!user) return res.status(401).json({ success: false, message: 'Invalid refresh token' });
+    // 1. Verify the refresh token
+    const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET, {
+      issuer: 'nextstop',
+      audience: 'nextstop-app',
+    });
 
-    const tokens = generateTokens({ sub: user.id, role: user.role });
+    // 2. Check if user still exists/is active
+    const [user] = await db('users').where({ id: decoded.sub, is_active: 1 }).limit(1);
+    if (!user) {
+      return res.status(401).json({ success: false, message: 'User account inactive' });
+    }
+
+    // 3. Generate a fresh pair of tokens
+    const payload = { sub: user.id, role: user.role };
+    const tokens = generateTokens(payload);
+
+    // Rotate the refresh token in DB for token family security
     await db('users').where({ id: user.id }).update({ refresh_token: tokens.refreshToken });
+
     res.json({ success: true, data: tokens });
-  } catch {
-    res.status(401).json({ success: false, message: 'Refresh token invalid or expired' });
+  } catch (err) {
+    return res.status(401).json({ success: false, message: 'Invalid refresh token. Please log in again.' });
   }
 });
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// POST /api/auth/verify-nin   (Driver KYC — Marketplace NIN API)
+// KYC VERIFICATION ROUTES (Docs-Accurate)
 // ═══════════════════════════════════════════════════════════════════════════════
+
 /**
- * ⚠️  Uses MKT credentials (Marketplace). NOT QTB credentials.
- *
- * Flutter sends: { nin: "12345678901" }
- * Server calls:  Marketplace NIN API with MKT Bearer token
- * On success:    users.nin_verified = TRUE
- * Flutter gets:  { success: true }
+ * POST /api/auth/verify-nin
+ * Verifies National Identity Number
  */
-router.post(
-  '/verify-nin',
-  authenticate,
-  authorize('DRIVER'),
-  [body('nin').matches(/^\d{11}$/).withMessage('NIN must be exactly 11 digits')],
-  async (req, res) => {
-    if (handleValidationErrors(req, res)) return;
-
-    const { nin }  = req.body;
-    const userId   = req.user.id;
-
-    // Load fresh user record to check current verification status
-    const [user] = await db('users').where({ id: userId }).limit(1);
-    if (user?.nin_verified) {
-      return res.json({ success: true, message: 'NIN already verified', alreadyVerified: true });
+router.post('/verify-nin', authenticate, async (req, res) => {
+  try {
+    const { nin } = req.body;
+    if (!nin) {
+      return res.status(400).json({ success: false, message: 'NIN is required' });
     }
 
-    try {
-      const { verified, reason } = await isw.verifyDriverNIN(nin, userId);
-
-      if (!verified) {
-        return res.status(422).json({
-          success: false,
-          message: reason === 'NIN_NOT_FOUND'
-            ? 'NIN not found in NIMC database — check the number and try again'
-            : 'NIN verification failed — please try again',
+    const result = await isw.verifyNIN(nin);
+    
+    if (result.verified) {
+      // Save verification status to users table
+      await db('users')
+        .where({ id: req.user.id })
+        .update({ 
+          nin: nin,
+          nin_verified: true,
+          updated_at: new Date()
         });
-      }
-
-      res.json({ success: true, message: 'NIN verified successfully' });
-    } catch (err) {
-      logger.error('[Auth] NIN error', { error: err.message, userId });
-      res.status(500).json({ success: false, message: err.message });
+      
+      res.json({ success: true, message: 'NIN Verified' });
+    } else {
+      res.status(400).json({ success: false, message: result.reason || 'Invalid NIN' });
     }
+  } catch (error) {
+    logger.error('[Auth] NIN verification error', { error: error.message, userId: req.user.id });
+    res.status(500).json({ success: false, message: 'Server error during NIN verification' });
   }
-);
+});
 
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// POST /api/auth/verify-licence   (Driver KYC — Marketplace Driver's License API)
-// ═══════════════════════════════════════════════════════════════════════════════
 /**
- * ⚠️  Uses MKT credentials (Marketplace). NOT QTB credentials.
- * Checks FRSC (Federal Road Safety Corps) database.
- *
- * Flutter sends: { licenseNumber: "ABC123456789" }
- * Server calls:  Marketplace Driver's License API with MKT Bearer token
- * Flutter gets:  { success: true, data: { expiryDate, licenceClass } }
+ * POST /api/auth/verify-dl
+ * Verifies Driver's License
  */
-router.post(
-  '/verify-licence',
-  authenticate,
-  authorize('DRIVER'),
-  [body('licenseNumber').notEmpty().trim().isLength({ min: 6, max: 20 })],
-  async (req, res) => {
-    if (handleValidationErrors(req, res)) return;
-
+router.post('/verify-dl', authenticate, async (req, res) => {
+  try {
     const { licenseNumber } = req.body;
-    const userId            = req.user.id;
+    if (!licenseNumber) {
+      return res.status(400).json({ success: false, message: 'License number is required' });
+    }
 
-    try {
-      const { verified, reason, licenseData } = await isw.verifyDriversLicense(licenseNumber, userId);
-
-      if (!verified) {
-        return res.status(422).json({
-          success: false,
-          message: reason === 'LICENSE_NOT_FOUND'
-            ? "Driver's licence not found — check the number and try again"
-            : "Driver's licence verification failed",
+    const result = await isw.verifyDriversLicense(licenseNumber);
+    
+    if (result.verified) {
+      // Update the drivers table based on schema (approval_status)
+      await db('drivers')
+        .where({ user_id: req.user.id })
+        .update({ 
+          approval_status: 'APPROVED',
+          updated_at: new Date()
         });
-      }
-
-      res.json({
-        success: true,
-        message: "Driver's licence verified successfully",
-        data: {
-          // TODO: Map to actual field names from Marketplace API Success Response tab
-          expiryDate:   licenseData?.expiryDate   || null,
-          licenceClass: licenseData?.licenceClass  || null,
-          issuingState: licenseData?.issuingState  || null,
-        },
-      });
-    } catch (err) {
-      logger.error('[Auth] Licence error', { error: err.message, userId });
-      res.status(500).json({ success: false, message: err.message });
+      
+      res.json({ success: true, message: 'Driver License Verified and Account Approved!' });
+    } else {
+      res.status(400).json({ success: false, message: result.message || 'Invalid License' });
     }
+  } catch (error) {
+    logger.error('[Auth] DL verification error', { error: error.message, userId: req.user.id });
+    res.status(500).json({ success: false, message: 'Server error during DL verification' });
   }
-);
-
+});
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// POST /api/auth/send-otp   (WhatsApp OTP — Marketplace WhatsApp OTP API)
+// OTP VERIFICATION ROUTES (Safetoken)
 // ═══════════════════════════════════════════════════════════════════════════════
+
 /**
- * ⚠️  Uses MKT credentials (Marketplace). NOT QTB credentials.
- *
- * KEY INSIGHT from Images 4 & 5:
- *   YOU generate the 6-digit OTP code on your server.
- *   You pass it in the request body to ISW.
- *   ISW simply DELIVERS that code to the user's WhatsApp.
- *   The OTP is valid for 5 minutes (per ISW docs, Image 4).
- *
- * This means confirming the OTP (POST /api/auth/confirm-otp) is a pure
- * local DB check — no second ISW call required.
- *
- * Flutter sends: { phoneNumber: "+2348012345678" }
- * Server does:
- *   1. Generates random 6-digit OTP
- *   2. Stores OTP in otp_store with 5-min expiry
- *   3. Calls Marketplace WhatsApp OTP API to deliver the code
- * Flutter gets: { success: true }
- *   Then shows user an OTP input field
+ * POST /api/auth/send-otp
+ * Triggers Safetoken OTP delivery
  */
-router.post(
-  '/send-otp',
-  authenticate,
-  [
-    body('phoneNumber')
-      .matches(/^\+[1-9]\d{10,14}$/)
-      .withMessage('Phone must be E.164 format: +2348012345678'),
-  ],
-  async (req, res) => {
-    if (handleValidationErrors(req, res)) return;
-
-    const { phoneNumber } = req.body;
-    const userId          = req.user.id;
-
-    try {
-      const { sent } = await isw.sendWhatsAppOTP(phoneNumber, userId);
-
-      if (!sent) {
-        return res.status(502).json({ success: false, message: 'OTP delivery failed — try again' });
-      }
-
-      res.json({ success: true, message: 'OTP sent to your WhatsApp — valid for 5 minutes' });
-    } catch (err) {
-      logger.error('[Auth] OTP send error', { error: err.message, userId });
-      res.status(500).json({ success: false, message: err.message });
+router.post('/send-otp', authenticate, async (req, res) => {
+  try {
+    const { email, phone } = req.body;
+    
+    // Calls Interswitch to generate and text/email the user
+    // tokenId is the user's ID for statless verification
+    const result = await isw.sendSafetoken(req.user.id, email, phone);
+    
+    if (result.success) {
+      res.json({ success: true, message: 'OTP sent successfully' });
+    } else {
+      res.status(400).json({ success: false, message: result.message });
     }
+  } catch (error) {
+    logger.error('[Auth] send-otp error', { error: error.message, userId: req.user.id });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
-);
+});
 
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// POST /api/auth/confirm-otp   (Local DB check — no ISW call needed)
-// ═══════════════════════════════════════════════════════════════════════════════
 /**
- * Because WE generated the OTP (and stored it in otp_store), validation
- * is a simple local database comparison — ISW doesn't need to be contacted again.
- *
- * Flutter sends: { code: "123456" }
- * Server does:   Look up otp_store where user_id matches, code matches, not expired
- * On success:    users.is_verified = TRUE, otp row marked used
- * Flutter gets:  { success: true }
+ * POST /api/auth/verify-otp
+ * Validates OTP with Magic OTP bypass for testing
  */
-router.post(
-  '/confirm-otp',
-  authenticate,
-  [body('code').matches(/^\d{6}$/).withMessage('OTP must be 6 digits')],
-  async (req, res) => {
-    if (handleValidationErrors(req, res)) return;
-
-    const { code } = req.body;
-    const userId   = req.user.id;
-
-    try {
-      const [otpRecord] = await db('otp_store')
-        .where({ user_id: userId, code, used: false, purpose: 'PHONE_VERIFY' })
-        .where('expires_at', '>', new Date())
-        .limit(1);
-
-      if (!otpRecord) {
-        return res.status(422).json({ success: false, message: 'Invalid or expired OTP' });
-      }
-
-      // Mark OTP as used and verify user atomically
-      await db.transaction(async trx => {
-        await trx('otp_store').where({ id: otpRecord.id }).update({ used: true });
-        await trx('users').where({ id: userId }).update({ is_verified: true, updated_at: new Date() });
-      });
-
-      res.json({ success: true, message: 'Phone number verified successfully' });
-    } catch (err) {
-      logger.error('[Auth] OTP confirm error', { error: err.message, userId });
-      res.status(500).json({ success: false, message: 'OTP confirmation failed' });
+router.post('/verify-otp', authenticate, async (req, res) => {
+  try {
+    const { code } = req.body; 
+    
+    if (!code) {
+      return res.status(400).json({ success: false, message: 'OTP code is required' });
     }
-  }
-);
 
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// POST /api/auth/verify-bvn   (Placeholder — BVN Full Details API)
-// ═══════════════════════════════════════════════════════════════════════════════
-/**
- * TODO:
- *   1. Subscribe to "BVN Full Details API" in your NextStop Marketplace project
- *   2. Open API → Endpoints tab → read exact request structure
- *   3. Implement the route body — isw.verifyBVN() is already stubbed
- *   4. Update MKT_BVN_URL in .env if the URL from docs differs
- *
- * ⚠️  Uses MKT credentials (Marketplace). NOT QTB credentials.
- */
-router.post(
-  '/verify-bvn',
-  authenticate,
-  authorize('DRIVER'),
-  [body('bvn').matches(/^\d{11}$/).withMessage('BVN must be exactly 11 digits')],
-  async (req, res) => {
-    if (handleValidationErrors(req, res)) return;
-
-    const { bvn }  = req.body;
-    const userId   = req.user.id;
-
-    try {
-      const { verified, bvnData } = await isw.verifyBVN(bvn, userId);
-
-      if (!verified) {
-        return res.status(422).json({ success: false, message: 'BVN verification failed — check number and try again' });
-      }
-
-      res.json({
-        success: true,
-        message: 'BVN verified successfully',
-        data: {
-          // TODO: Map actual field names from BVN API Success Response tab
-          firstName:   bvnData?.firstName   || null,
-          lastName:    bvnData?.lastName    || null,
-          dateOfBirth: bvnData?.dateOfBirth || null,
-        },
-      });
-    } catch (err) {
-      logger.error('[Auth] BVN error', { error: err.message, userId });
-      res.status(500).json({ success: false, message: err.message });
+    // 🛑 THE MAGIC OTP BYPASS (Only works if NOT in live production)
+    if (process.env.NODE_ENV !== 'production' && code === '123456') {
+      await db('users').where({ id: req.user.id }).update({ is_verified: true, updated_at: new Date() });
+      return res.json({ success: true, message: 'Magic OTP accepted! Phone verified.' });
     }
+
+    // 🟢 The Real Interswitch Flow
+    const result = await isw.verifySafetoken(req.user.id, code);
+
+    if (result.success) {
+      await db('users')
+        .where({ id: req.user.id })
+        .update({ is_verified: true, updated_at: new Date() });
+
+      res.json({ success: true, message: 'Phone verified successfully!' });
+    } else {
+      res.status(400).json({ success: false, message: result.message || 'Invalid or expired OTP' });
+    }
+  } catch (error) {
+    logger.error('[Auth] verify-otp error', { error: error.message, userId: req.user.id });
+    res.status(500).json({ success: false, message: 'Verification failed' });
   }
-);
-
+});
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// POST /api/auth/verify-bank   (Placeholder — Bank Account Verification API)
+// BANK ACCOUNT VERIFICATION ROUTES
 // ═══════════════════════════════════════════════════════════════════════════════
+
 /**
- * Use case: Verify a driver's payout bank account before first settlement.
- *
- * TODO:
- *   1. Subscribe to "Bank Account Verification API" in NextStop Marketplace project
- *   2. Open API → Endpoints tab → read exact request structure and field names
- *   3. Implement the route body — isw.verifyBankAccount() is already stubbed
- *   4. Update MKT_BANK_VERIFY_URL in .env if the URL differs
- *
- * ⚠️  Uses MKT credentials (Marketplace). NOT QTB credentials.
+ * GET /api/auth/bank-list
+ * Flutter uses this to populate a Dropdown menu of Nigerian banks
  */
-router.post(
-  '/verify-bank',
-  authenticate,
-  authorize('DRIVER'),
-  [
-    body('accountNumber').isLength({ min: 10, max: 10 }).withMessage('Account number must be 10 digits'),
-    body('bankCode').notEmpty().withMessage('Bank code required'),
-  ],
-  async (req, res) => {
-    if (handleValidationErrors(req, res)) return;
+router.get('/bank-list', authenticate, async (req, res) => {
+  try {
+    const result = await isw.getBankList();
+    if (result.success) {
+      res.json({ success: true, data: result.data });
+    } else {
+      res.status(500).json({ success: false, message: result.message });
+    }
+  } catch (error) {
+    logger.error('[Auth] bank-list error', { error: error.message });
+    res.status(500).json({ success: false, message: 'Server error fetching banks' });
+  }
+});
 
+/**
+ * POST /api/auth/verify-bank
+ * Verify Bank Account & Save to Driver Profile
+ */
+router.post('/verify-bank', authenticate, async (req, res) => {
+  try {
     const { accountNumber, bankCode } = req.body;
-    const userId                      = req.user.id;
-
-    try {
-      const { verified, accountName } = await isw.verifyBankAccount(accountNumber, bankCode, userId);
-
-      if (!verified) {
-        return res.status(422).json({ success: false, message: 'Bank account could not be verified — check details and try again' });
-      }
-
-      res.json({
-        success: true,
-        message: 'Bank account verified',
-        data: { accountName },   // show driver the resolved account name for confirmation
-      });
-    } catch (err) {
-      logger.error('[Auth] Bank verify error', { error: err.message, userId });
-      res.status(500).json({ success: false, message: err.message });
+    
+    if (!accountNumber || !bankCode) {
+      return res.status(400).json({ success: false, message: 'Account number and bank code required' });
     }
+
+    // Sandbox test trap: Use accountNumber "1000000000" and bankCode "058"
+    const result = await isw.verifyBankAccount(accountNumber, bankCode);
+
+    if (result.success) {
+      // 🚀 AUTOMATION: Onboard driver as a sub-account for split settlements
+      const user = await db('users').where({ id: req.user.id }).first();
+      const onboarding = await isw.createDriverSubAccount({
+        accountNumber,
+        bankCode,
+        fullName: user.full_name
+      });
+
+      // Update the drivers table with bank details and sub-account code
+      await db('drivers')
+        .where({ user_id: req.user.id })
+        .update({ 
+          payout_bank_code: bankCode,
+          payout_account_no: accountNumber,
+          payout_account_name: result.data.accountName,
+          sub_account_code: onboarding.success ? onboarding.subAccountCode : null,
+          updated_at: new Date()
+        });
+
+      res.json({ 
+        success: true, 
+        message: 'Bank account verified ' + (onboarding.success ? 'and payout sub-account created' : 'but sub-account creation pending'),
+        accountName: result.data.accountName,
+        subAccountCode: onboarding.subAccountCode 
+      });
+    } else {
+      res.status(400).json({ success: false, message: result.message });
+    }
+  } catch (error) {
+    logger.error('[Auth] verify-bank error', { error: error.message, userId: req.user.id });
+    res.status(500).json({ success: false, message: 'Server error during bank verification' });
   }
-);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PHYSICAL ADDRESS VERIFICATION ROUTES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * POST /api/auth/verify-address/submit
+ * Submit Address for Verification (with Magic Bypass)
+ */
+router.post('/verify-address/submit', authenticate, async (req, res) => {
+  try {
+    const addressData = req.body; 
+
+    // 🛑 THE MAGIC BYPASS FOR LOCAL TESTING
+    if (process.env.NODE_ENV !== 'production' && addressData.street === 'Magic Street') {
+      // Instantly approve them in the database for testing purposes
+      await db('drivers')
+        .where({ user_id: req.user.id })
+        .update({ 
+          address_verification_ref: 'MAGIC_REF_123',
+          updated_at: new Date()
+        });
+
+      return res.json({ 
+        success: true, 
+        message: 'Magic Address bypassed and verified!',
+        reference: 'MAGIC_REF_123'
+      });
+    }
+
+    // The Real Interswitch Flow
+    const result = await isw.submitAddressVerification(addressData);
+
+    if (result.success) {
+      // Save the reference ID to the driver's profile
+      await db('drivers')
+        .where({ user_id: req.user.id })
+        .update({ 
+          address_verification_ref: result.reference,
+          updated_at: new Date()
+        });
+
+      res.json({ 
+        success: true, 
+        message: 'Address submitted for verification',
+        reference: result.reference
+      });
+    } else {
+      res.status(400).json({ success: false, message: result.message });
+    }
+  } catch (error) {
+    logger.error('[Auth] address-submit error', { error: error.message, userId: req.user.id });
+    res.status(500).json({ success: false, message: 'Server error during address submission' });
+  }
+});
+
+/**
+ * GET /api/auth/verify-address/status
+ * Check Address Verification Status
+ */
+router.get('/verify-address/status', authenticate, async (req, res) => {
+  try {
+    const { reference } = req.query; 
+    
+    if (!reference) {
+       return res.status(400).json({ success: false, message: 'Reference ID is required' });
+    }
+
+    const result = await isw.checkAddressStatus(reference);
+
+    if (result.success) {
+      res.json({ success: true, data: result.data });
+      // Logic for updating DB on 'Verified' status can go here
+    } else {
+      res.status(400).json({ success: false, message: result.message });
+    }
+  } catch (error) {
+    logger.error('[Auth] address-status error', { error: error.message, userId: req.user.id });
+    res.status(500).json({ success: false, message: 'Server error checking address status' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WHATSAPP OTP ROUTES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * POST /api/auth/send-whatsapp-otp
+ * Trigger WhatsApp OTP delivery and store code in DB
+ */
+router.post('/send-whatsapp-otp', authenticate, async (req, res) => {
+  try {
+    const { phone } = req.body;
+    if (!phone) {
+      return res.status(400).json({ success: false, message: 'Phone number required' });
+    }
+    
+    // Generate a random 6-digit code
+    const generatedCode = Math.floor(100000 + Math.random() * 900000).toString();
+
+    const result = await isw.sendWhatsAppOTP(phone, generatedCode);
+    
+    if (result.success) {
+      // Save code to database with a 5-minute expiry
+      await db('otp_store').insert({
+        id: uuidv4(),
+        user_id: req.user.id,
+        purpose: 'PHONE_VERIFY',
+        code: generatedCode,
+        expires_at: new Date(Date.now() + 5 * 60000) 
+      });
+
+      res.json({ success: true, message: 'OTP sent to WhatsApp' });
+    } else {
+      res.status(400).json({ success: false, message: result.message });
+    }
+  } catch (error) {
+    logger.error('[Auth] whatsapp-otp error', { error: error.message, userId: req.user.id });
+    res.status(500).json({ success: false, message: 'Server error sending WhatsApp OTP' });
+  }
+});
 
 
 module.exports = router;

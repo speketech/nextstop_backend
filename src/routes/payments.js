@@ -70,7 +70,8 @@ router.post(
         });
       }
 
-      // 3. Initiate with Interswitch
+      // 3. Initiate with Interswitch (Delayed Split/Escrow Flow)
+      // We no longer pass splits here; funds stay in Main Wallet until ride completion.
       const user = await db('users').where({ id: userId }).first();
       const { txRef, paymentUrl } = await isw.initiatePayment({
         rideId,
@@ -79,6 +80,7 @@ router.post(
         amountNaira,
         customerEmail: user.email,
         customerName:  user.full_name,
+        splits:        [] // Empty splits for delayed settlement
       });
 
       // 4. Store payment URL for reference
