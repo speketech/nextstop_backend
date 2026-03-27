@@ -66,7 +66,7 @@ router.post('/', express.raw({ type: 'application/json' }), async (req, res) => 
   try {
     // Both versions of the success event
     if (eventType === 'PAYMENT_SUCCESS' || eventType === 'Transaction.Success') {
-      await handlePaymentSuccess(payload);
+      await handlePaymentSuccess(payload, req.app);
     } else if (eventType === 'PAYMENT_REVERSAL') {
       await handlePaymentReversal(payload);
     } else {
@@ -92,7 +92,7 @@ router.post('/', express.raw({ type: 'application/json' }), async (req, res) => 
 
 // ─── Handlers ────────────────────────────────────────────────────────────────
 
-async function handlePaymentSuccess(payload) {
+async function handlePaymentSuccess(payload, app) {
   const txRef = payload.transactionReference;
   if (!txRef) throw new Error('Missing transactionReference in webhook payload');
 
@@ -105,7 +105,27 @@ async function handlePaymentSuccess(payload) {
       rideId: transaction.ride_id,
       amount: transaction.amount_naira,
     });
-    // Additional post-payment logic: send push notification to driver, etc.
+
+    const rideId = transaction.ride_id;
+    const payerType = transaction.payer_type;
+
+    // ── 5. Ride Status Advancement ──────────────────────────────────────────
+    // If the initiator pays, we move the ride to ACCEPTED
+    if (payerType === 'INITIATOR') {
+      await db('rides')
+        .where({ id: rideId, status: 'REQUESTED' })
+        .update({ status: 'ACCEPTED', accepted_at: new Date() });
+    }
+
+    // ── 6. Real-time Notification via Socket.io ──────────────────────────────
+    const io = app.get('io');
+    if (io) {
+      io.to(`ride:${rideId}`).emit('ride:status', { 
+        rideId, 
+        status: (payerType === 'INITIATOR') ? 'ACCEPTED' : 'JOINER_PAID' 
+      });
+      logger.debug('[Webhook] Socket event emitted', { rideId });
+    }
   }
 }
 
