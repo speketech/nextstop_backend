@@ -1,0 +1,70 @@
+services:
+  - type: web
+    name: nextstop-api
+    env: node
+    region: oregon # Choose a region closest to Lagos/TiDB
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: "production"
+      - key: PORT
+        value: "10000" # Quotes force this to be a string instead of an integer
+      - key: APP_NAME
+        value: "NextStop"
+      
+      # The 'sync: false' flag means Render will prompt you to enter these 
+      # securely in the dashboard, keeping them out of your source code.
+      - key: DB_HOST
+        sync: false
+      - key: DB_PORT
+        value: "4000" # Quotes added here too
+      - key: DB_USER
+        sync: false
+      - key: DB_PASSWORD
+        sync: false
+      - key: DB_NAME
+        sync: false
+        
+      # JWT Secrets
+      - key: JWT_ACCESS_SECRET
+        sync: false
+      - key: JWT_REFRESH_SECRET
+        sync: false
+      - key: JWT_ACCESS_EXPIRES
+        value: "15m"
+      - key: JWT_REFRESH_EXPIRES
+        value: "30d"
+        
+      # Interswitch Credentials
+      - key: QTB_PRODUCT_ID
+        sync: false
+      - key: QTB_PAY_ITEM_ID
+        sync: false
+      - key: QTB_CLIENT_ID
+        sync: false
+      - key: QTB_CLIENT_SECRET
+        sync: false
+      - key: QTB_WEBHOOK_SECRET
+        sync: false
+      - key: QTB_PASSPORT_URL
+        value: "https://api.interswitchng.com"
+      - key: QTB_BASE_URL
+        value: "https://api.interswitchng.com"
+      - key: QTB_VERIFY_URL
+        value: "https://api.interswitchng.com/collections/api/v1/gettransaction.json"
+      - key: PAYMENT_REDIRECT_URL
+        value: "https://nextstop.ng/payment/callback"
+        
+      # Marketplace Credentials
+      - key: MKT_CLIENT_ID
+        sync: false
+      - key: MKT_CLIENT_SECRET
+        sync: false
+      - key: MKT_PASSPORT_URL
+        value: "https://passport.k8.isw.la"
+        
+      # Gemini API
+      - key: GEMINI_API_KEY
+        sync: false
