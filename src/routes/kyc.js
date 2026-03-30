@@ -1,3 +1,5 @@
+'use strict';
+
 const express = require('express');
 const router = express.Router();
 const { body, validationResult } = require('express-validator');
@@ -5,8 +7,9 @@ const { authenticate, authorize } = require('../middleware/auth');
 const isw = require('../services/interswitchService');
 const db = require('../config/database');
 const logger = require('../config/logger');
+const { v4: uuidv4 } = require('uuid');
 
-// ── Validation error handler ──────────────────────────────────────────────────
+// ── Validation Error Handler ──────────────────────────────────────────────────
 function handleValidationErrors(req, res) {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
@@ -16,144 +19,125 @@ function handleValidationErrors(req, res) {
   return false;
 }
 
-// 1. Trigger WhatsApp OTP
-router.post(
-  '/send-otp',
-  authenticate,
-  [
-    body('phone').matches(/^\+?[0-9]{10,15}$/).withMessage('Valid phone required'),
-  ],
-  async (req, res) => {
-    if (handleValidationErrors(req, res)) return;
-    try {
-      const { phone } = req.body;
-      const result = await isw.sendWhatsAppOTP(phone, req.user.id);
-      res.json({ success: result.sent, message: 'OTP sent via WhatsApp' });
-    } catch (error) {
-      res.status(500).json({ success: false, message: error.message });
-    }
-  }
-);
+// ═══════════════════════════════════════════════════════════════════════════════
+// 1. PHONE & OTP VERIFICATION (Safetoken & WhatsApp)
+// ═══════════════════════════════════════════════════════════════════════════════
 
-// 2. Verify the OTP entered by the user
-router.post(
-  '/verify-otp',
-  authenticate,
-  [
-    body('code').matches(/^\d{6}$/).withMessage('OTP must be 6 digits'),
-  ],
-  async (req, res) => {
-    if (handleValidationErrors(req, res)) return;
-    try {
-      const { code } = req.body;
-      // Find unexpired, unused OTP in our database
-      const [otpRecord] = await db('otp_store')
-        .where({ user_id: req.user.id, code: code, used: 0 })
-        .andWhere('expires_at', '>', new Date())
-        .limit(1);
+/** POST /api/kyc/otp/send */
+router.post('/otp/send', authenticate, async (req, res) => {
+  try {
+    const { phone, method = 'SMS' } = req.body;
+    let result;
 
-      if (!otpRecord) {
-        return res.status(400).json({ success: false, message: 'Invalid or expired OTP' });
-      }
-
-      // Mark as used and update user verification status
-      await db('otp_store').where({ id: otpRecord.id }).update({ used: 1 });
-      await db('users').where({ id: req.user.id }).update({ is_verified: 1 });
-
-      res.json({ success: true, message: 'Phone verified successfully' });
-    } catch (error) {
-      res.status(500).json({ success: false, message: 'Verification failed' });
-    }
-  }
-);
-
-// 3. Verify NIN securely via Interswitch
-router.post(
-  '/verify-nin',
-  authenticate,
-  [
-    body('nin').matches(/^\d{11}$/).withMessage('NIN must be exactly 11 digits'),
-  ],
-  async (req, res) => {
-    if (handleValidationErrors(req, res)) return;
-    try {
-      const { nin } = req.body;
-      const result = await isw.verifyDriverNIN(nin, req.user.id);
-      
-      if (result.verified) {
-        res.json({ success: true, message: 'NIN Verified! "Verified" badge unlocked.' });
-      } else {
-        res.status(400).json({ success: false, message: 'NIN Verification failed' });
-      }
-    } catch (error) {
-      res.status(500).json({ success: false, message: 'Service unavailable' });
-    }
-  }
-);
-
-// 4. Verify Driver's Licence
-router.post(
-  '/verify-licence',
-  authenticate,
-  authorize('DRIVER'),
-  [body('licenseNumber').notEmpty().trim().isLength({ min: 6, max: 20 })],
-  async (req, res) => {
-    if (handleValidationErrors(req, res)) return;
-    const { licenseNumber } = req.body;
-    try {
-      const { verified, reason, licenseData } = await isw.verifyDriversLicense(licenseNumber, req.user.id);
-      if (!verified) {
-        return res.status(422).json({
-          success: false,
-          message: reason === 'LICENSE_NOT_FOUND' ? "Driver's licence not found" : "Verification failed",
+    if (method === 'WHATSAPP') {
+      const code = Math.floor(100000 + Math.random() * 900000).toString();
+      result = await isw.sendWhatsAppOTP(phone, code);
+      if (result.success) {
+        await db('otp_store').insert({
+          id: uuidv4(), user_id: req.user.id, code,
+          expires_at: new Date(Date.now() + 5 * 60000)
         });
       }
-      res.json({ success: true, data: licenseData });
-    } catch (err) {
-      res.status(500).json({ success: false, message: err.message });
+    } else {
+      // Default Interswitch Safetoken
+      result = await isw.sendSafetoken(req.user.id, req.user.email, phone);
     }
-  }
-);
 
-// 5. Verify BVN
-router.post(
-  '/verify-bvn',
-  authenticate,
-  authorize('DRIVER'),
-  [body('bvn').matches(/^\d{11}$/).withMessage('BVN must be 11 digits')],
-  async (req, res) => {
-    if (handleValidationErrors(req, res)) return;
-    const { bvn } = req.body;
-    try {
-      const { verified, bvnData } = await isw.verifyBVN(bvn, req.user.id);
-      if (!verified) return res.status(422).json({ success: false, message: 'BVN verification failed' });
-      res.json({ success: true, data: bvnData });
-    } catch (err) {
-      res.status(500).json({ success: false, message: err.message });
-    }
+    res.json({ success: result.success || result.sent, message: 'OTP sent' });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'OTP failed' });
   }
-);
+});
 
-// 6. Verify Bank Account
-router.post(
-  '/verify-bank',
-  authenticate,
-  authorize('DRIVER'),
-  [
-    body('accountNumber').isLength({ min: 10, max: 10 }),
-    body('bankCode').notEmpty(),
-  ],
-  async (req, res) => {
-    if (handleValidationErrors(req, res)) return;
-    const { accountNumber, bankCode } = req.body;
-    try {
-      const { verified, accountName } = await isw.verifyBankAccount(accountNumber, bankCode, req.user.id);
-      if (!verified) return res.status(422).json({ success: false, message: 'Bank verify failed' });
-      res.json({ success: true, data: { accountName } });
-    } catch (err) {
-      res.status(500).json({ success: false, message: err.message });
-    }
+/** POST /api/kyc/otp/verify */
+router.post('/otp/verify', authenticate, async (req, res) => {
+  const { code } = req.body;
+  if (!code) return res.status(400).json({ success: false, message: 'Code required' });
+
+  // Magic Bypass for testing
+  if (process.env.NODE_ENV !== 'production' && code === '123456') {
+    await db('users').where({ id: req.user.id }).update({ is_verified: true });
+    return res.json({ success: true, message: 'Magic OTP accepted' });
   }
-);
+
+  // Check DB for WhatsApp/Internal OTP first
+  const [otpRecord] = await db('otp_store')
+    .where({ user_id: req.user.id, code, used: 0 })
+    .andWhere('expires_at', '>', new Date()).limit(1);
+
+  if (otpRecord) {
+    await db('otp_store').where({ id: otpRecord.id }).update({ used: 1 });
+    await db('users').where({ id: req.user.id }).update({ is_verified: true });
+    return res.json({ success: true, message: 'OTP Verified' });
+  }
+
+  // Fallback to Interswitch Safetoken verification
+  const result = await isw.verifySafetoken(req.user.id, code);
+  if (result.success) {
+    await db('users').where({ id: req.user.id }).update({ is_verified: true });
+    res.json({ success: true, message: 'Phone verified' });
+  } else {
+    res.status(400).json({ success: false, message: 'Invalid OTP' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 2. DOCUMENT VERIFICATION (NIN, DL, BVN)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/** POST /api/kyc/verify-nin */
+router.post('/verify-nin', authenticate, async (req, res) => {
+  const { nin } = req.body;
+  try {
+    const result = await isw.verifyNIN(nin, req.user.id);
+    if (result.verified) {
+      await db('users').where({ id: req.user.id }).update({ nin, nin_verified: true });
+      res.json({ success: true, message: 'NIN Verified' });
+    } else {
+      res.status(400).json({ success: false, message: 'NIN Failed' });
+    }
+  } catch (err) { res.status(500).json({ success: false, message: 'Service error' }); }
+});
+
+/** POST /api/kyc/verify-licence */
+router.post('/verify-licence', authenticate, authorize('DRIVER'), async (req, res) => {
+  const { licenseNumber } = req.body;
+  try {
+    const result = await isw.verifyDriversLicense(licenseNumber, req.user.id);
+    if (result.verified) {
+      await db('drivers').where({ user_id: req.user.id }).update({ approval_status: 'APPROVED' });
+      res.json({ success: true, message: 'License Verified' });
+    } else {
+      res.status(400).json({ success: false, message: 'Invalid License' });
+    }
+  } catch (err) { res.status(500).json({ success: false, message: 'Service error' }); }
+});
+
+/** POST /api/kyc/verify-bvn */
+router.post('/verify-bvn', authenticate, authorize('DRIVER'), async (req, res) => {
+  const { bvn } = req.body;
+  const result = await isw.verifyBVN(bvn, req.user.id);
+  res.json({ success: result.verified, data: result.bvnData });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 3. BANKING & ADDRESS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+router.get('/bank-list', authenticate, async (req, res) => {
+  const result = await isw.getBankList();
+  res.json(result);
+});
+
+router.post('/verify-bank', authenticate, authorize('DRIVER'), async (req, res) => {
+  const { accountNumber, bankCode } = req.body;
+  const result = await isw.verifyBankAccount(accountNumber, bankCode, req.user.id);
+  if (result.success || result.verified) {
+    // Logic for sub-account creation can be added here as seen in auth.js
+    res.json({ success: true, data: result.data || result.accountName });
+  } else {
+    res.status(400).json({ success: false, message: 'Bank verification failed' });
+  }
+});
 
 module.exports = router;
