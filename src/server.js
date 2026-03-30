@@ -15,20 +15,26 @@ const server = http.createServer(app);
 // ─── Production CORS Configuration ──────────────────────────────────────────
 const allowedOrigins = [
   'https://cynthax.onrender.com', 
-  'http://localhost:5000',        
-  process.env.FRONTEND_URL        
+  'https://cynthax.onrender.com/', // Added trailing slash for safety
+  'http://localhost:5000'
 ];
 
-app.use(helmet());
 app.use(cors({
   origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes(origin) || process.env.NODE_ENV === 'development') {
+    // If there's no origin (like a mobile app) or it matches our list, allow it
+    if (!origin || allowedOrigins.includes(origin) || allowedOrigins.includes(`${origin}/`)) {
       callback(null, true);
     } else {
-      callback(new Error('CORS blocked for this origin'));
+      logger.error(`CORS Blocked for origin: ${origin}`);
+      callback(new Error('Not allowed by CORS'));
     }
   },
   credentials: true
+}));
+
+app.use(helmet({
+  crossOriginResourcePolicy: false,
+  contentSecurityPolicy: false, // Flutter Web often needs this disabled for CanvasKit/Fonts
 }));
 
 // ─── Body Parsing & Webhooks ─────────────────────────────────────────────────
