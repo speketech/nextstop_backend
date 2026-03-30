@@ -11,6 +11,7 @@ const db = require('./config/database');
 const app = express();
 const server = http.createServer(app);
 
+// ── CORS & Security ─────────────────────────────────────────────────────────
 app.use(cors({ origin: 'https://cynthax.onrender.com', credentials: true }));
 
 // ── Body Parsing & Webhooks ─────────────────────────────────────────────────
