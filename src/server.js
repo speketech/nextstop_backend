@@ -14,9 +14,9 @@ const server = http.createServer(app);
 
 // ─── Production CORS Configuration ──────────────────────────────────────────
 const allowedOrigins = [
-  'https://cynthax.onrender.com', // Your Live Flutter Web App
-  'http://localhost:5000',        // Local Flutter Debugging
-  process.env.FRONTEND_URL        // Fallback from Render Env
+  'https://cynthax.onrender.com', 
+  'http://localhost:5000',        
+  process.env.FRONTEND_URL        
 ];
 
 app.use(helmet());
@@ -32,11 +32,25 @@ app.use(cors({
 }));
 
 // ─── Body Parsing & Webhooks ─────────────────────────────────────────────────
-// REGISTER WEBHOOKS BEFORE GLOBAL JSON MIDDLEWARE
 app.use('/webhooks/interswitch', express.raw({ type: 'application/json' }));
-
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: false }));
+
+
+// This must be here to resolve the "Cannot GET /health" error
+app.get('/health', async (_req, res) => {
+  try {
+    await db.raw('SELECT 1'); // Check if TiDB is alive
+    res.json({ 
+      status: 'ok', 
+      db: 'connected', 
+      service: 'nextstop-api', 
+      ts: new Date().toISOString() 
+    });
+  } catch (err) {
+    res.status(503).json({ status: 'degraded', database: 'disconnected' });
+  }
+});
 
 // ─── API Routes ──────────────────────────────────────────────────────────────
 app.use('/api/auth', require('./routes/auth'));
@@ -48,9 +62,9 @@ app.use('/webhooks/interswitch', require('./routes/webhooks'));
 const io = new Server(server, {
   cors: { origin: allowedOrigins, credentials: true }
 });
-app.set('io', io); // Accessible in routes via req.app.get('io')
+app.set('io', io);
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  logger.info(`🚀 NextStop API Live on Port ${PORT} [Production]`);
+  logger.info(`NextStop API Live on Port ${PORT} [Production]`);
 });
