@@ -10,49 +10,43 @@ const logger = require('../config/logger');
 
 /**
  * POST /webhooks/interswitch
- *
- * Handles asynchronous payment notifications from Interswitch.
- * Uses raw body (registered via express.raw) for accurate HMAC validation.
- *
- * Event types handled:
- *  - PAYMENT_SUCCESS
- *  - PAYMENT_REVERSAL
+ * * Handles real-time payment notifications from Interswitch.
+ * Note: express.raw() is already handled in server.js for this path.
  */
-router.post('/', express.raw({ type: 'application/json' }), async (req, res) => {
-  const rawBody  = req.body; // Buffer — needed for HMAC
+router.post('/', async (req, res) => {
+  const rawBody  = req.body; // Buffer provided by express.raw
   const sigHeader = req.headers['x-interswitch-signature'];
 
   // ── 1. Validate HMAC Signature ───────────────────────────────────────────
-  // Signature first, then rawBody Buffer
+  // Uses QTB_WEBHOOK_SECRET from your Render environment
   const isValidSig = isw.validateWebhookSignature(sigHeader, rawBody);
+  
   if (!isValidSig) {
     logger.warn('[Webhook] Invalid Interswitch signature', { sig: sigHeader });
-    // Return 200 to prevent ISW from retrying — log for investigation
-    return res.status(200).json({ received: true });
+    // Always return 200 to Interswitch to acknowledge receipt and prevent retries
+    return res.status(200).json({ received: true, error: 'Invalid Signature' });
   }
 
   let payload;
   try {
     payload = JSON.parse(rawBody.toString('utf8'));
-  } catch {
-    logger.error('[Webhook] Failed to parse payload');
-    return res.status(400).json({ success: false });
+  } catch (err) {
+    logger.error('[Webhook] Failed to parse JSON payload');
+    return res.status(200).json({ received: true, error: 'Parse Failed' });
   }
 
   const eventId   = payload.eventId || uuidv4();
   const eventType = payload.eventType || 'UNKNOWN';
 
-  // ── 2. Idempotency — deduplicate re-delivered events ────────────────────
-  const [existing] = await db('webhook_events')
-    .where({ id: eventId })
-    .limit(1);
-
+  // ── 2. Idempotency Check ──────────────────────────────────────────────────
+  // Prevents processing the same notification twice
+  const [existing] = await db('webhook_events').where({ id: eventId }).limit(1);
   if (existing) {
     logger.info('[Webhook] Duplicate event ignored', { eventId });
     return res.status(200).json({ received: true, duplicate: true });
   }
 
-  // ── 3. Persist event log BEFORE processing ───────────────────────────────
+  // ── 3. Initial Log ───────────────────────────────────────────────────────
   await db('webhook_events').insert({
     id:         eventId,
     source:     'INTERSWITCH',
@@ -62,9 +56,8 @@ router.post('/', express.raw({ type: 'application/json' }), async (req, res) => 
     processed:  false,
   });
 
-  // ── 4. Process based on event type ───────────────────────────────────────
+  // ── 4. Process the Event ─────────────────────────────────────────────────
   try {
-    // Both versions of the success event
     if (eventType === 'PAYMENT_SUCCESS' || eventType === 'Transaction.Success') {
       await handlePaymentSuccess(payload, req.app);
     } else if (eventType === 'PAYMENT_REVERSAL') {
@@ -73,7 +66,6 @@ router.post('/', express.raw({ type: 'application/json' }), async (req, res) => 
       logger.info('[Webhook] Unhandled event type', { eventType });
     }
 
-    // Mark as processed
     await db('webhook_events')
       .where({ id: eventId })
       .update({ processed: true, processed_at: new Date() });
@@ -83,70 +75,60 @@ router.post('/', express.raw({ type: 'application/json' }), async (req, res) => 
     await db('webhook_events')
       .where({ id: eventId })
       .update({ error_message: err.message });
-    // Still return 200 — we've logged it; ISW should not retry
   }
 
-  // ISW expects a 200 acknowledgment immediately
+  // Interswitch requires a 200 OK to stop sending the notification
   res.status(200).json({ received: true });
 });
 
 // ─── Handlers ────────────────────────────────────────────────────────────────
 
+/**
+ * Advances the ride state and notifies the UI when payment is confirmed
+ */
 async function handlePaymentSuccess(payload, app) {
   const txRef = payload.transactionReference;
-  if (!txRef) throw new Error('Missing transactionReference in webhook payload');
+  if (!txRef) throw new Error('Missing transactionReference in webhook');
 
-  // Re-verify server-to-server (belt AND suspenders)
+  // Verify server-to-server for final confirmation
   const { verified, transaction } = await isw.verifyTransaction(txRef);
 
   if (verified) {
-    logger.info('[Webhook] Payment success confirmed', {
-      txRef,
-      rideId: transaction.ride_id,
-      amount: transaction.amount_naira,
-    });
-
     const rideId = transaction.ride_id;
     const payerType = transaction.payer_type;
 
-    // ── 5. Ride Status Advancement ──────────────────────────────────────────
-    // If the initiator pays, we move the ride to ACCEPTED
+    // Advance Ride Status if the Initiator pays
     if (payerType === 'INITIATOR') {
       await db('rides')
         .where({ id: rideId, status: 'REQUESTED' })
         .update({ status: 'ACCEPTED', accepted_at: new Date() });
     }
 
-    // ── 6. Real-time Notification via Socket.io ──────────────────────────────
+    // Emit Socket event for real-time UI update
     const io = app.get('io');
     if (io) {
       io.to(`ride:${rideId}`).emit('ride:status', { 
         rideId, 
         status: (payerType === 'INITIATOR') ? 'ACCEPTED' : 'JOINER_PAID' 
       });
-      logger.debug('[Webhook] Socket event emitted', { rideId });
     }
+    
+    logger.info('[Webhook] Payment success processed', { txRef, rideId });
   }
 }
 
+/**
+ * Flags transactions that were reversed by the bank or gateway
+ */
 async function handlePaymentReversal(payload) {
   const txRef = payload.transactionReference;
-  if (!txRef) throw new Error('Missing transactionReference in reversal payload');
+  if (!txRef) throw new Error('Missing transactionReference in reversal');
 
   await db('transactions')
     .where({ tx_ref: txRef })
     .update({ status: 'REVERSED', updated_at: new Date() });
 
-  // Fetch the transaction to get the ride
-  const [tx] = await db('transactions').where({ tx_ref: txRef }).limit(1);
-
-  if (tx) {
-    logger.warn('[Webhook] Payment reversed — flagging ride', {
-      txRef,
-      rideId: tx.ride_id,
-    });
-    // Could trigger ride cancellation or driver notification here
-  }
+  logger.warn('[Webhook] Transaction REVERSED', { txRef });
 }
 
 module.exports = router;
